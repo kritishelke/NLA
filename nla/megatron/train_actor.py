@@ -860,11 +860,13 @@ class NLAMegatronActor(MegatronTrainRayActor):
             trained_on=[self.args.prompt_data] if self.args.prompt_data else [],
             parent_checkpoints=[self.args.hf_checkpoint],
             created_by="nla.megatron.train_actor.NLAMegatronActor",
+            # Same training_args keys as NLAFSDPActor._write_sidecar — the
+            # sidecar schema must not depend on the training backend. (num_layers
+            # is already in the checkpoint's config.json; don't duplicate it here.)
             training_args={
                 "rollout_id": rollout_id,
                 "lr": self.args.lr,
                 "loss_type": self.args.loss_type,
                 "global_batch_size": self.args.global_batch_size,
-                "num_layers": self.args.num_layers,
             },
         )

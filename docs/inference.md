@@ -174,23 +174,31 @@ to return the result to the user anyway.
 
 ## Model-specific parameters
 
-| | Qwen2.5-7B-Instruct | Gemma-3-12B-IT |
-|---|---|---|
-| `d_model` | 3584 | 3840 |
-| extraction `layer_index` | 20 (≈ 2/3 depth of 28) | 32 (≈ 2/3 depth of 48) |
-| `injection_char` | `㈎` U+320E | `㈜` U+321C |
-| `injection_token_id` | 149705 | 246566 |
-| **`injection_scale`** | **150** | **80000** |
-| **`embed_scale` (post-lookup)** | **1.0** | **√3840 ≈ 61.97** |
-| `bos_token` | None | `<bos>` (already in chat template) |
-| HF repo gated | no | **yes** — `HF_TOKEN` required |
-| nested multimodal wrapper | no | **yes** — `config.text_config`, `model.language_model` |
+| | Qwen2.5-7B-Instruct | Gemma-3-12B-IT | Gemma-3-27B-IT | Llama-3.3-70B-Instruct |
+|---|---|---|---|---|
+| `d_model` | 3584 | 3840 | 5376 | 8192 |
+| extraction `layer_index` | 20 (of 28)¹ | 32 (≈ 2/3 of 48) | 41 (≈ 2/3 of 62) | 53 (≈ 2/3 of 80) |
+| `injection_char` | `㈎` U+320E | `㈜` U+321C | `㈜` U+321C | `㎡` U+33A1 |
+| `injection_token_id` | 149705 | 246566 | 246566 | 105565 |
+| **`injection_scale`** | **150** | **80000** | **60000** | **30** |
+| **`embed_scale` (post-lookup)** | **1.0** | **√3840 ≈ 61.97** | **√5376 ≈ 73.32** | **1.0** |
+| `bos_token` | None | `<bos>` (already in chat template) | `<bos>` | `<\|begin_of_text\|>` |
+| HF repo gated | no | **yes** — `HF_TOKEN` required | **yes** | **yes** |
+| nested multimodal wrapper | no | **yes** — `config.text_config`, `model.language_model` | **yes** | no |
 
-**`injection_scale` differs ~500×** because Gemma's scaled embedding layer
-multiplies by √d in the forward pass, inflating residual-stream norms
-(measured mean ≈ 74k at layer 32 vs Qwen's ≈ 125 at layer 20).
-`injection_scale` is picked as a round number a bit above the mean norm of
-the dataset's vectors.
+¹ Qwen's layer 20 is a historical choice the released checkpoints depend on, not
+the 2/3-depth rule (which would give 18).
+
+These values all live in each checkpoint's `nla_meta.yaml` sidecar — the table
+is for orientation; **always load from the sidecar**, never hardcode.
+
+**`injection_scale` spans ~2500×** across models (30 for Llama to 80000 for
+Gemma-12B) because residual-stream norms differ wildly: Gemma's scaled
+embedding layer multiplies by √d in the forward pass, inflating norms
+(measured mean ≈ 74k at layer 32 vs Qwen's ≈ 125 at layer 20), while Llama's
+layer-53 norms are smaller still. In each case `injection_scale` is picked as
+a round number a bit above the mean norm of the dataset's vectors — using one
+model's scale with another's checkpoint is the classic injection failure.
 
 **`embed_scale`**: Gemma-3's `Gemma3TextScaledWordEmbedding.forward()`
 multiplies by `√hidden_size`. Loading the raw weight tensor into a plain
@@ -439,3 +447,36 @@ mse = ((pred_n - gold_n) ** 2).mean()      # ~0.2 good, ~1 mediocre, ~2 orthogon
 The standalone `nla_inference.py` includes `NLACritic` — loads the truncated
 backbone + `value_head.safetensors`, provides `.reconstruct(text)` and
 `.score(text, original_vector)`. See the class docstring for usage.
+
+### Computing FVE — two classic footguns
+
+FVE (fraction of variance explained) over a dataset of (gold, pred) pairs:
+
+```python
+gold_n = gold / gold.norm(dim=-1, keepdim=True) * mse_scale     # [N, d]
+pred_n = pred / pred.norm(dim=-1, keepdim=True) * mse_scale     # [N, d]
+
+mu = gold_n.mean(dim=0)            # mean of the NORMALIZED golds — do NOT normalize mu itself
+
+fve = 1 - ((pred_n - gold_n) ** 2).mean() / ((gold_n - mu) ** 2).mean()
+```
+
+Two mistakes that produce plausible-looking but wrong numbers:
+
+1. **You must normalize the AR's output by hand.** `NLACritic.reconstruct()`
+   returns the *raw, unnormalized* predicted vector (`.score()` normalizes
+   internally, but anything you compute yourself from `reconstruct()` output
+   doesn't). Skipping `pred_n` makes the numerator norm-sensitive and the
+   resulting "FVE" meaningless.
+
+2. **Do not normalize the mean in the denominator.** The denominator is the
+   variance of the normalized golds around their mean `mu` — and `mu` of
+   unit-sphere vectors lies *inside* the sphere (‖mu‖ < mse_scale). Projecting
+   it back to the sphere (`normalize(mu)`) inflates the denominator
+   (≈ 0.94 vs ≈ 0.72 for Qwen layer-20) and therefore inflates FVE.
+   The released `fve_nrm` numbers (e.g. 0.752 for Qwen) use the un-normalized
+   mean, matching the classical FVE definition and the `fve_nrm` metric
+   logged during training (`nla.loss`'s `nla_baseline_rawvar`).
+
+`nla.schema.compute_predict_mean_baselines` computes both denominators if you
+want to compare; only the raw-mean one is the headline FVE.

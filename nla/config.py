@@ -256,6 +256,13 @@ def write_model_sidecar(checkpoint_dir: str, cfg: NLAConfig, *, role: str, stage
 
     Called from NLAFSDPActor.save_model. Mirrors the dataset sidecar writer in
     nla/datagen/sidecar.py but for the model-checkpoint schema (arch doc §2).
+
+    This is the canonical schema for BOTH training backends — FSDP and Megatron
+    writers pass identical training_args keys ({rollout_id, lr, loss_type,
+    global_batch_size}). Some released checkpoints carry legacy extras from an
+    older Megatron writer (`layer`, `role_aliases`, `training.num_layers`) and a
+    release-scrubber-added top-level `extraction_layer_index`; readers should
+    tolerate and ignore unknown keys.
     """
     meta: dict[str, Any] = {
         "kind": "nla_model",

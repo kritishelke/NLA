@@ -58,10 +58,19 @@ Measured on 2× H100-80GB. Data: 100k UltraFineWeb documents × 5 vectors =
 **Step time**: ~3s. ~31% MFU.
 **Peak memory**: ~67GB / 82GB.
 **Loss trajectory**: 1.61 (step 0, identity init) → 1.08 (step 23) → 0.72 (step 380) → **0.586** final.
-**Predict-the-mean baseline**: 0.938 (the critic's achievable loss with constant pred = normalize(μ),
-since the loss normalizes pred too). **FVE = 1 − 0.586/0.938 = 37.5%**. Note: critic_rand (shuffled
-targets) got 0.922 ≈ baseline — can only do constant-pred with no real signal, as expected. Computed
-automatically at startup (`nla.schema.load_predict_mean_baselines`) and logged per-step as `train/fve`.
+**Predict-the-mean baselines** — there are two, and which one you divide by matters
+(see "Computing FVE" in docs/inference.md):
+
+- **raw-mean (canonical)**: MSE(v̂, μ) ≈ 0.72, the variance of the normalized golds around
+  their *un-normalized* mean. This is the classical FVE denominator — `train/fve` and all
+  released `fve_nrm` numbers use it. **Do not normalize μ.**
+- **normalized-mean**: MSE(v̂, normalize(μ)) = 0.938, the critic's best achievable loss with
+  a constant prediction (its output also gets normalized). Useful as a "is it learning at
+  all?" gate — critic_rand (shuffled targets) got 0.922 ≈ this, as expected — but it
+  inflates FVE if used as the denominator.
+
+Both computed automatically at startup (`nla.schema.compute_predict_mean_baselines`);
+`fve_nrm` is logged per-step against the raw-mean baseline (`nla_baseline_rawvar`).
 
 ### ⚠️ Critical: identity-init `value_head`
 
@@ -214,6 +223,25 @@ in each released checkpoint's `nla_meta.yaml` records what was in effect at save
 prompts per step (× G=8 samples = the 1024-sample global batch here), and its
 "learning rate of 10⁻⁵" is the parity LR rounded from 1.41e-5; the KL coefficient is
 the value above.
+
+### All four released model families
+
+The other three families reused the Qwen recipe with light per-model adjustment
+(no per-model sweep). Ground truth is each released checkpoint's `nla_meta.yaml`
+`training:` block; summarized here. GRPO group size 8 and the 150-token response
+cap apply everywhere; LRs ran at actor/critic parity.
+
+| | backend | RL global batch | RL lr (AV = AR) |
+|---|---|---|---|
+| Qwen2.5-7B (L20) | FSDP | 1024 | 1.41e-5† |
+| Gemma-3-12B (L32) | FSDP | 1024 | 1e-5 |
+| Gemma-3-27B (L41) | FSDP | 2048 | 1.41e-5 |
+| Llama-3.3-70B (L53) | Megatron | 4096 | 5e-6 |
+
+† see footnote above re: the Qwen AR sidecar recording 7.07e-5 at save time.
+
+Note the paper appendix's single "batch size of 128, lr 10⁻⁵" describes the
+Qwen/12B-scale runs; 27B and 70B used the larger batches and adjusted LRs above.
 
 **Tuning headroom**: throughput knobs (micro-batch size, attention implementation,
 dynamic batching) were not profiled carefully and are not optimised for any particular
