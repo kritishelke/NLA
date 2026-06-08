@@ -243,9 +243,9 @@ actor/critic parity.
 
 ‡ The raw `--global-batch-size` arg recorded at save time. For Qwen/12B this
 equals the actual 1024 samples per rollout, and the 27B run may genuinely have
-used 2048 (256 prompts × 8). The 70B entry is the doubtful one: the run did not
-use 4096-sample (512-prompt) steps — the recorded arg does not necessarily
-equal samples per optimizer step.
+used 2048 (256 prompts × 8). The 70B run varied its batch size over training —
+1024 and 4096 at various times; the sidecar's 4096 is just the value in effect
+at the final save, so don't read it as the whole-run configuration.
 
 **Tuning headroom**: throughput knobs (micro-batch size, attention implementation,
 dynamic batching) were not profiled carefully and are not optimised for any particular
