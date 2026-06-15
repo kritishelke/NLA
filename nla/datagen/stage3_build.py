@@ -48,16 +48,15 @@ _INJECT_PLACEHOLDER = "<INJECT>"
 # Matches the paper appendix prompt template, but 2-3 snippets
 # (not 4-5) since that's what our stage2 API prompt produces. The
 # {injection_char} slot is what becomes <INJECT> in the parquet (then the real
-# injection char at training time). Neighbor-ID computation in build_token_meta
-# looks at the bytes immediately around {injection_char}, so keep the
-# <concept>...</concept> wrapping tight.
+# injection char at training time). Spaces inside <concept> tags prevent
+# Qwen's BPE from merging the injection char with surrounding > and < chars.
 _DEFAULT_ACTOR_TEMPLATE = """You are a meticulous AI researcher conducting an important investigation into activation vectors from a language model. Your overall task is to describe the semantic content of that activation vector.
 
 We will pass the vector enclosed in <concept> tags into your context. You must then produce an explanation for the vector, enclosed within <explanation> tags. The explanation consists of 2-3 text snippets describing that vector.
 
 Here is the vector:
 
-<concept>{injection_char}</concept>
+<concept> {injection_char} </concept>
 
 Please provide an explanation."""
 # Critic template ends with a fixed suffix (no marker char). Training extracts

@@ -217,11 +217,16 @@ def compute_canonical_neighbors(
     (<concept>㊗</concept>) so the trailing chat-template scaffolding is identical.
     """
     content = actor_template.format(injection_char=injection_char)
-    ids = tokenizer.apply_chat_template(
+    # Use tokenize=False + encode() instead of tokenize=True — the latter returns
+    # a mixed list of strings and ints for special tokens in some tokenizer
+    # versions, which breaks decode([tid]). encode() always returns List[int].
+    # add_special_tokens=False matches apply_chat_template(tokenize=True) behaviour.
+    rendered: str = tokenizer.apply_chat_template(
         [{"role": "user", "content": content}],
-        tokenize=True,
+        tokenize=False,
         add_generation_prompt=True,
     )
+    ids: list[int] = tokenizer.encode(rendered, add_special_tokens=False)
     matches = [i for i, tid in enumerate(ids) if tid == injection_token_id]
     assert len(matches) == 1, (
         f"injection token id {injection_token_id} ({injection_char!r}) appears "

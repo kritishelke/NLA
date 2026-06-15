@@ -54,34 +54,109 @@ def _tokenize_one(tokenizer: Any, text: str) -> list[int]:
     return tokenizer(text, add_special_tokens=False)["input_ids"]
 
 
-def find_injection_token(tokenizer: Any) -> tuple[str, int]:
-    """Auto-pick a single-token CJK char for activation injection. Cached."""
+def _find_inctx_token_id(
+    tokenizer: Any, actor_template: str, char: str
+) -> int | None:
+    """Return the token ID that `char` gets inside the rendered actor prompt.
+
+    Uses apply_chat_template(tokenize=False) + encode() instead of
+    apply_chat_template(tokenize=True) to avoid the mixed-type list some
+    tokenizer versions return for special tokens (strings, not ints).
+
+    BPE context-merging (e.g. tiktoken prepending the preceding space into
+    the char's token) means the in-context ID can differ from the isolation
+    ID. This function always returns the in-context ID.
+
+    Returns None if the char doesn't appear as exactly one unique token.
+    """
+    content = actor_template.format(injection_char=char)
+    rendered: str = tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    # add_special_tokens=False matches apply_chat_template(tokenize=True) behaviour —
+    # special tokens are already embedded in the rendered string as literals.
+    full_ids: list[int] = tokenizer.encode(rendered, add_special_tokens=False)
+
+    # Find every token whose decoded text contains the injection char.
+    matching: list[tuple[int, int]] = []  # (position, token_id)
+    for i, tid in enumerate(full_ids):
+        if char in tokenizer.decode([tid]):
+            matching.append((i, tid))
+
+    if len(matching) != 1:
+        return None  # char absent, split across tokens, or in multiple tokens
+
+    inctx_id = matching[0][1]
+    # The in-context ID must be unique in the full prompt — no accidental matches.
+    if sum(1 for t in full_ids if t == inctx_id) != 1:
+        return None
+
+    return inctx_id
+
+
+def find_injection_token(
+    tokenizer: Any, actor_template: str | None = None
+) -> tuple[str, int]:
+    """Auto-pick a single-token CJK char for activation injection. Cached.
+
+    When actor_template is provided (strongly recommended), the returned token
+    ID is the IN-CONTEXT ID — what the char gets inside the rendered prompt.
+    For BPE tokenizers that merge the preceding space into the char token
+    (e.g. Qwen2.5 / tiktoken), the in-context ID differs from the isolation
+    ID. Training scans for the in-context ID, so the sidecar must store it.
+    """
     key = tokenizer.name_or_path
     cache = _load_cache()
 
     if key in cache:
         cached_char = cache[key]["char"]
         cached_id = cache[key]["token_id"]
-        # Re-verify — tokenizer version drift can change IDs.
-        ids = _tokenize_one(tokenizer, cached_char)
-        assert len(ids) == 1 and ids[0] == cached_id, (
-            f"cached injection token for {key!r} no longer valid: "
-            f"{cached_char!r} now tokenizes to {ids} (cached id={cached_id}). "
-            f"Delete the cache entry and rerun, or pin a known-good tokenizer version."
-        )
-        return cached_char, cached_id
+        if actor_template is not None:
+            inctx_id = _find_inctx_token_id(tokenizer, actor_template, cached_char)
+            assert inctx_id is not None, (
+                f"cached injection char {cached_char!r} for {key!r} no longer appears "
+                f"as a unique single token in the actor template. "
+                f"Delete the cache entry in injection_token_cache.yaml and rerun."
+            )
+            if inctx_id != cached_id:
+                # Cache had the isolation ID; update to the correct in-context ID.
+                cache[key]["token_id"] = inctx_id
+                _save_cache(cache)
+            return cached_char, inctx_id
+        else:
+            # Legacy call without template — isolation-only check.
+            ids = _tokenize_one(tokenizer, cached_char)
+            assert len(ids) == 1 and ids[0] == cached_id, (
+                f"cached injection token for {key!r} no longer valid: "
+                f"{cached_char!r} now tokenizes to {ids} (cached id={cached_id}). "
+                f"Delete the cache entry and rerun."
+            )
+            return cached_char, cached_id
 
     lo, hi = _INJECTION_RANGE
     for codepoint in range(lo, hi + 1):
         char = chr(codepoint)
-        ids = _tokenize_one(tokenizer, char)
-        if len(ids) == 1:
+        # Pre-filter: must be a single token in isolation.
+        if len(_tokenize_one(tokenizer, char)) != 1:
+            continue
+
+        if actor_template is not None:
+            inctx_id = _find_inctx_token_id(tokenizer, actor_template, char)
+            if inctx_id is None:
+                continue
+            cache[key] = {"char": char, "token_id": inctx_id}
+            _save_cache(cache)
+            return char, inctx_id
+        else:
+            ids = _tokenize_one(tokenizer, char)
             cache[key] = {"char": char, "token_id": ids[0]}
             _save_cache(cache)
             return char, ids[0]
 
     raise AssertionError(
-        f"no single-token CJK char found in U+{lo:04X}–U+{hi:04X} for tokenizer "
+        f"no suitable injection char found in U+{lo:04X}–U+{hi:04X} for tokenizer "
         f"{key!r}. Hand-pick a character and add it to injection_token_cache.yaml."
     )
 
@@ -130,7 +205,7 @@ def build_token_meta(
     Neighbor computation delegates to nla.schema.compute_canonical_neighbors —
     same function training-side verification uses.
     """
-    inj_char, inj_id = find_injection_token(tokenizer)
+    inj_char, inj_id = find_injection_token(tokenizer, actor_template)
     left_id, right_id = compute_canonical_neighbors(tokenizer, actor_template, inj_char, inj_id)
 
     suffix_ids = compute_critic_suffix_ids(tokenizer, critic_template) if critic_template else None

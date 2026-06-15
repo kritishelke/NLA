@@ -14,6 +14,7 @@ import asyncio
 from abc import ABC, abstractmethod
 
 import anthropic
+import httpx
 
 
 class CompletionProvider(ABC):
@@ -127,3 +128,80 @@ class AnthropicProvider(CompletionProvider):
         if n_failed or n_refused:
             print(f"  [AnthropicProvider] dropped {n_refused} refused + {n_failed} retry-exhausted of {len(prompts)}")
         return out
+
+
+class LocalChatProvider(CompletionProvider):
+    """Provider for any OpenAI-compatible local server (SGLang, vLLM, llama.cpp).
+
+    Launch your server first, e.g.:
+        python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct \\
+            --port 30000 --disable-radix-cache
+
+    Then pass to stage 2:
+        --provider-cls nla.datagen.providers.LocalChatProvider \\
+        --provider-kwargs '{"base_url":"http://localhost:30000/v1","model":"Qwen/Qwen2.5-7B-Instruct"}'
+
+    `base_url` must end with /v1. `model` must match what the server reports
+    (check /v1/models if unsure — for SGLang it's the --model-path value).
+
+    None is returned for any request that errors after `max_retries` attempts;
+    stage 2 drops those rows rather than killing the whole chunk.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:30000/v1",
+        model: str = "default",
+        max_tokens: int = 300,
+        temperature: float = 1.0,
+        concurrency: int = 32,
+        max_retries: int = 3,
+        timeout: float = 120.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.concurrency = concurrency
+        self.max_retries = max_retries
+        self.timeout = timeout
+
+    async def _one(
+        self,
+        client: httpx.AsyncClient,
+        sem: asyncio.Semaphore,
+        prompt: str,
+    ) -> str | None:
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+        async with sem:
+            for attempt in range(self.max_retries):
+                try:
+                    resp = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        timeout=self.timeout,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    text = data["choices"][0]["message"]["content"].strip()
+                    return text if text else None
+                except (httpx.HTTPStatusError, httpx.TransportError, KeyError) as exc:
+                    if attempt == self.max_retries - 1:
+                        print(f"  [LocalChatProvider] gave up after {self.max_retries} attempts: {exc}")
+                        return None
+        return None  # unreachable, satisfies type checker
+
+    def complete(self, prompts: list[str]) -> list[str | None]:
+        async def _run() -> list[str | None]:
+            sem = asyncio.Semaphore(self.concurrency)
+            async with httpx.AsyncClient() as client:
+                return list(
+                    await asyncio.gather(*(self._one(client, sem, p) for p in prompts))
+                )
+
+        return asyncio.run(_run())

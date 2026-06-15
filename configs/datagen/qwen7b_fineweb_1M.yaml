@@ -29,11 +29,13 @@ stage1:
   seed: 42
 
 stage2:
-  provider_cls: nla.datagen.providers.AnthropicProvider
+  provider_cls: nla.datagen.providers.LocalChatProvider
   provider_kwargs:
-    model: claude-haiku-4-5-20251001
-    max_tokens: 300
-    concurrency: 400
+    base_url: "http://localhost:30000/v1"
+    model: "meta-llama/Llama-3.1-8B-Instruct"
+    max_tokens: 350
+    concurrency: 64
+    temperature: 1.0
   chunk_size: 512
 
 stage3:
