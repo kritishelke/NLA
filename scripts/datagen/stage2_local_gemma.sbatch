@@ -14,7 +14,21 @@
 # source builds that need Rust/nvcc. NOTE: `conda activate` is broken on this
 # cluster (changes prompt, not PATH), so create the env then use its ABSOLUTE
 # bin paths — never rely on activation:
-#   module load Miniconda3
+#   # Load CUDA toolkit so sglang can find nvcc for JIT kernel compilation and
+# CUDA graph capture. Without this, CUDA_HOME is unset and the server crashes
+# during graph capture (even though the GPU/model loads fine).
+# Find the right name with: module avail cuda
+module load CUDA/12.6.0 2>/dev/null || module load cuda 2>/dev/null || module load CUDA 2>/dev/null || true
+# If none of the above worked, set CUDA_HOME from nvcc location if accessible.
+if [ -z "$CUDA_HOME" ] && command -v nvcc &>/dev/null; then
+    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+fi
+if [ -n "$CUDA_HOME" ]; then
+    echo "[stage2] CUDA_HOME=$CUDA_HOME"
+else
+    echo "[stage2] WARNING: CUDA_HOME not found — falling back to --disable-cuda-graph (reduced throughput)"
+fi
+module load Miniconda3
 #   source "$(conda info --base)/etc/profile.d/conda.sh"
 #   conda create -y -p /projects/sanghani_nlp/envs/nla-stage2 python=3.11
 #   E=/projects/sanghani_nlp/envs/nla-stage2
@@ -93,13 +107,16 @@ python -c "import sglang, pyarrow, httpx, nla.datagen.stage2_api_explain" 2>/dev
 # context-length is capped low: stage-2 prompts are ~800 in + 300 out, so a big
 # KV cache is wasted memory that would otherwise cut achievable concurrency.
 echo "[stage2] launching SGLang server for $MODEL (tp=$TP) on port $PORT"
+SGLANG_EXTRA_ARGS=""
+[ -z "$CUDA_HOME" ] && SGLANG_EXTRA_ARGS="--disable-cuda-graph"
 python -m sglang.launch_server \
     --model-path "$MODEL" \
     --port "$PORT" \
     --tp "$TP" \
     --attention-backend fa3 \
     --context-length 4096 \
-    --mem-fraction-static 0.9 &
+    --mem-fraction-static 0.9 \
+    $SGLANG_EXTRA_ARGS &
 SERVER_PID=$!
 
 # Always kill the server when this script exits (success, failure, or timeout).
