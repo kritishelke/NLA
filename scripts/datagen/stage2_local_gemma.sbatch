@@ -11,13 +11,16 @@
 # ONE-TIME ENV SETUP (run on the LOGIN node — it has internet; compute nodes
 # may not). The env MUST be Python 3.11 — sglang's deps (outlines_core,
 # sgl-kernel, flashinfer) have no prebuilt wheels for 3.13 and fall back to
-# source builds that need Rust/nvcc. Use `conda activate` (not `source
-# activate`, which is a broken shim here):
+# source builds that need Rust/nvcc. NOTE: `conda activate` is broken on this
+# cluster (changes prompt, not PATH), so create the env then use its ABSOLUTE
+# bin paths — never rely on activation:
 #   module load Miniconda3
 #   source "$(conda info --base)/etc/profile.d/conda.sh"
 #   conda create -y -p /projects/sanghani_nlp/envs/nla-stage2 python=3.11
-#   conda activate /projects/sanghani_nlp/envs/nla-stage2
-#   pip install "sglang[all]>=0.5.6" pyarrow pyyaml orjson httpx anthropic tqdm
+#   E=/projects/sanghani_nlp/envs/nla-stage2
+#   "$E/bin/python" --version    # must say 3.11.x
+#   "$E/bin/pip" install --upgrade pip
+#   "$E/bin/pip" install "sglang[all]>=0.5.6" pyarrow pyyaml orjson httpx anthropic tqdm
 # Then submit with: CONDA_ENV=/projects/sanghani_nlp/envs/nla-stage2 sbatch ...
 #
 #SBATCH --job-name=nla_stage2_gemma
@@ -48,19 +51,20 @@ SMOKE_ROWS="${SMOKE_ROWS:-}"
 
 mkdir -p "$PROJ/logs"
 
-module load Miniconda3
-# Use the conda hook + `conda activate`, NOT `source activate`: on this module
-# `source activate` is a broken shim in non-interactive shells — it sets the
-# prompt but does not prepend the env's bin/ to PATH, silently leaving you on
-# the base (3.13) interpreter. The hook makes `conda activate` work properly.
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
-# Hard guard: confirm we actually switched interpreters (catches a stale prompt
-# / failed activation before we waste a GPU allocation).
-case "$(command -v python)" in
-    "$CONDA_ENV"/bin/python) : ;;
-    *) echo "[stage2] ERROR: activation failed — python is $(command -v python), expected $CONDA_ENV/bin/python" >&2; exit 1 ;;
-esac
+# Activate by prepending the env's bin/ to PATH directly. We deliberately do
+# NOT use `conda activate` / `source activate`: on this cluster's Miniconda
+# module both silently fail to switch the interpreter (they change the prompt
+# but leave base 3.13 first on PATH). A conda *prefix* env is self-contained,
+# so a PATH-prepend is sufficient and bulletproof.
+export PATH="$CONDA_ENV/bin:$PATH"
+export CONDA_PREFIX="$CONDA_ENV"
+# Hard guard: confirm python is actually the env's interpreter before we waste a
+# GPU allocation.
+if [ "$(command -v python)" != "$CONDA_ENV/bin/python" ]; then
+    echo "[stage2] ERROR: env not usable — python is $(command -v python), expected $CONDA_ENV/bin/python" >&2
+    echo "[stage2] Check that $CONDA_ENV/bin/python exists (was the env created?)." >&2
+    exit 1
+fi
 
 export HF_HOME="${HF_HOME:-$PROJ/hf_cache}"
 # Weights are pre-downloaded to HF_HOME on the login node; force offline so the
