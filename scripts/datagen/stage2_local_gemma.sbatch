@@ -7,28 +7,10 @@
 #
 # Submit:  sbatch scripts/datagen/stage2_local_gemma.sbatch
 # Smoke:   SMOKE_ROWS=500 sbatch scripts/datagen/stage2_local_gemma.sbatch
+# Full:    sbatch --time=06:00:00 scripts/datagen/stage2_local_gemma.sbatch
 #
-# ONE-TIME ENV SETUP (run on the LOGIN node — it has internet; compute nodes
-# may not). The env MUST be Python 3.11 — sglang's deps (outlines_core,
-# sgl-kernel, flashinfer) have no prebuilt wheels for 3.13 and fall back to
-# source builds that need Rust/nvcc. NOTE: `conda activate` is broken on this
-# cluster (changes prompt, not PATH), so create the env then use its ABSOLUTE
-# bin paths — never rely on activation:
-#   # Load CUDA toolkit so sglang can find nvcc for JIT kernel compilation and
-# CUDA graph capture. Without this, CUDA_HOME is unset and the server crashes
-# during graph capture (even though the GPU/model loads fine).
-# Find the right name with: module avail cuda
-module load CUDA/12.6.0 2>/dev/null || module load cuda 2>/dev/null || module load CUDA 2>/dev/null || true
-# If none of the above worked, set CUDA_HOME from nvcc location if accessible.
-if [ -z "$CUDA_HOME" ] && command -v nvcc &>/dev/null; then
-    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
-fi
-if [ -n "$CUDA_HOME" ]; then
-    echo "[stage2] CUDA_HOME=$CUDA_HOME"
-else
-    echo "[stage2] WARNING: CUDA_HOME not found — falling back to --disable-cuda-graph (reduced throughput)"
-fi
-module load Miniconda3
+# ONE-TIME ENV SETUP (login node, needs internet):
+#   module load Miniconda3
 #   source "$(conda info --base)/etc/profile.d/conda.sh"
 #   conda create -y -p /projects/sanghani_nlp/envs/nla-stage2 python=3.11
 #   E=/projects/sanghani_nlp/envs/nla-stage2
@@ -37,16 +19,21 @@ module load Miniconda3
 #   "$E/bin/pip" install "sglang[all]>=0.5.6" pyarrow pyyaml orjson httpx anthropic tqdm
 # Then submit with: CONDA_ENV=/projects/sanghani_nlp/envs/nla-stage2 sbatch ...
 #
+# NOTE: conda activate / source activate are broken on this cluster (change the
+# prompt but not PATH). The script activates by PATH-prepend instead.
+#
+# NOTE: CUDA_HOME must be set for sglang JIT kernel compilation. The script
+# tries common CUDA module names and falls back to --disable-cuda-graph if none
+# work. Find the right name with: module avail cuda
+#
 #SBATCH --job-name=nla_stage2_gemma
 #SBATCH --account=sanghani_nlp
 #SBATCH --partition=a100_normal_q
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=00:30:00
-# ^^^ Default is 30 min — enough for a smoke run (server startup ~3min + small
-# slice). For the full ~500k-row production run override at submit time:
-#   sbatch --time=06:00:00 scripts/datagen/stage2_local_gemma.sbatch
-# Shorter time limits queue faster (Slurm backfill favors short jobs).
+# ^^^ 30 min default: enough for smoke (server ~3 min + small slice).
+# Full ~500k-row run: sbatch --time=06:00:00 ... (shorter limits queue faster).
 #SBATCH --output=/projects/sanghani_nlp/logs/%x_%j.out
 
 set -eo pipefail
@@ -58,44 +45,55 @@ SPL="${SPL:-$PROJ/activations/qwen7b_fineweb_100k/splits}"
 MODEL="${MODEL:-google/gemma-3-27b-it}"
 PORT="${PORT:-30000}"
 CONCURRENCY="${CONCURRENCY:-64}"
-# Prefix env (activate by full path, NOT by name — `source activate hf` fails).
-CONDA_ENV="${CONDA_ENV:-/projects/sanghani_nlp/envs/hf}"
-# Tensor-parallel degree. Keep 1 for an 80GB A100 (27B bf16 ~54GB fits). Bump to
-# 2 (and request --gres=gpu:2) if the node is a 40GB A100.
+# Full path to the Python 3.11 conda prefix env. Do NOT use env name — conda
+# activate is broken on this cluster (changes prompt, not PATH).
+CONDA_ENV="${CONDA_ENV:-/projects/sanghani_nlp/envs/nla-stage2}"
+# Tensor-parallel degree. 1 for 80 GB A100 (27B bf16 ~54 GB fits).
+# Set to 2 (and --gres=gpu:2) for 40 GB nodes.
 TP="${TP:-1}"
-# Set SMOKE_ROWS=N to run a tiny N-row slice end-to-end before the full pass.
+# Set SMOKE_ROWS=N to run a tiny N-row slice before the full pass.
 SMOKE_ROWS="${SMOKE_ROWS:-}"
 # ---------------------------------------------------------------------------
 
 mkdir -p "$PROJ/logs"
 
-# Activate by prepending the env's bin/ to PATH directly. We deliberately do
-# NOT use `conda activate` / `source activate`: on this cluster's Miniconda
-# module both silently fail to switch the interpreter (they change the prompt
-# but leave base 3.13 first on PATH). A conda *prefix* env is self-contained,
-# so a PATH-prepend is sufficient and bulletproof.
+# ---- CUDA: load toolkit so sglang can JIT-compile kernels and use CUDA graphs
+# Without CUDA_HOME the server crashes during graph capture. Try common module
+# names; if none work, fall back to --disable-cuda-graph (server still runs,
+# just slower). Find the right name with: module avail cuda
+module load Miniconda3    # load this first — some clusters need it before cuda
+module load CUDA/12.6.0 2>/dev/null \
+    || module load cuda/12.6.0 2>/dev/null \
+    || module load CUDA 2>/dev/null \
+    || module load cuda 2>/dev/null \
+    || true
+if [ -z "$CUDA_HOME" ] && command -v nvcc &>/dev/null; then
+    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+fi
+if [ -n "$CUDA_HOME" ]; then
+    echo "[stage2] CUDA_HOME=$CUDA_HOME"
+else
+    echo "[stage2] WARNING: CUDA_HOME not found — using --disable-cuda-graph (reduced throughput)"
+fi
+
+# ---- activate env by PATH-prepend (conda activate is broken on this cluster)
 export PATH="$CONDA_ENV/bin:$PATH"
 export CONDA_PREFIX="$CONDA_ENV"
-# Hard guard: confirm python is actually the env's interpreter before we waste a
-# GPU allocation.
 if [ "$(command -v python)" != "$CONDA_ENV/bin/python" ]; then
     echo "[stage2] ERROR: env not usable — python is $(command -v python), expected $CONDA_ENV/bin/python" >&2
-    echo "[stage2] Check that $CONDA_ENV/bin/python exists (was the env created?)." >&2
+    echo "[stage2] Check that $CONDA_ENV/bin/python exists (was the env created with python=3.11?)." >&2
     exit 1
 fi
 
 export HF_HOME="${HF_HOME:-$PROJ/hf_cache}"
-# Weights are pre-downloaded to HF_HOME on the login node; force offline so the
-# compute node never reaches out to HF (it may have no internet). Override with
-# HF_HUB_OFFLINE=0 if you intend the job to download.
+# Weights pre-downloaded on login node; force offline so compute nodes (which
+# may have no internet) don't try to reach HF. Override with HF_HUB_OFFLINE=0.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 [ -f "$HOME/.hf_token" ] && export HF_TOKEN="$(cat "$HOME/.hf_token")"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 cd "$REPO"
 
-# Pre-flight: fail fast with an actionable message if the env isn't provisioned,
-# rather than dying halfway through after allocating a GPU. See ONE-TIME ENV
-# SETUP in the header.
+# Pre-flight: fail fast before wasting GPU time if deps are missing.
 python -c "import sglang, pyarrow, httpx, nla.datagen.stage2_api_explain" 2>/dev/null || {
     echo "[stage2] ERROR: env '$CONDA_ENV' is missing deps (sglang / pyarrow / httpx / nla)." >&2
     echo "[stage2] Run the ONE-TIME ENV SETUP from this script's header on the LOGIN node." >&2
@@ -104,11 +102,11 @@ python -c "import sglang, pyarrow, httpx, nla.datagen.stage2_api_explain" 2>/dev
 
 # ---- launch the SGLang server ---------------------------------------------
 # Gemma-3 REQUIRES --attention-backend fa3 (flashinfer OOMs on head_dim=256).
-# context-length is capped low: stage-2 prompts are ~800 in + 300 out, so a big
-# KV cache is wasted memory that would otherwise cut achievable concurrency.
+# context-length capped at 4096: stage-2 prompts are ~800 in + 300 out.
 echo "[stage2] launching SGLang server for $MODEL (tp=$TP) on port $PORT"
 SGLANG_EXTRA_ARGS=""
 [ -z "$CUDA_HOME" ] && SGLANG_EXTRA_ARGS="--disable-cuda-graph"
+# shellcheck disable=SC2086
 python -m sglang.launch_server \
     --model-path "$MODEL" \
     --port "$PORT" \
@@ -127,8 +125,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---- wait for the server to be ready --------------------------------------
-echo "[stage2] waiting for server health (timeout 900s)..."
+# ---- wait for the server to be ready (timeout 900s) ----------------------
+echo "[stage2] waiting for server health..."
 for i in $(seq 1 180); do
     if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
         echo "[stage2] server is up after ~$((i*5))s"
@@ -138,10 +136,7 @@ for i in $(seq 1 180); do
         echo "[stage2] ERROR: server process died during startup — check log above" >&2
         exit 1
     fi
-    if [ "$i" -eq 180 ]; then
-        echo "[stage2] ERROR: server did not become healthy within 900s" >&2
-        exit 1
-    fi
+    [ "$i" -eq 180 ] && { echo "[stage2] ERROR: server did not become healthy within 900s" >&2; exit 1; }
     sleep 5
 done
 
