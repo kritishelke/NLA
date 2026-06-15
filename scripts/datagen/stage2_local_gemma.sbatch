@@ -28,7 +28,11 @@
 #SBATCH --partition=a100_normal_q
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=08:00:00
+#SBATCH --time=00:30:00
+# ^^^ Default is 30 min — enough for a smoke run (server startup ~3min + small
+# slice). For the full ~500k-row production run override at submit time:
+#   sbatch --time=06:00:00 scripts/datagen/stage2_local_gemma.sbatch
+# Shorter time limits queue faster (Slurm backfill favors short jobs).
 #SBATCH --output=/projects/sanghani_nlp/logs/%x_%j.out
 
 set -eo pipefail
